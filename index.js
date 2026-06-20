@@ -4,14 +4,29 @@ const zlib = require('zlib');
 const yauzl = require('yauzl');
 
 function printHelp() {
-  console.log(`placsp-filter\n\nUsage:\n  node index.js <zip-file> --search "madrid" [--field all|authority|city|title|summary] [--exact] [--output json|csv|<file-path>]\n\nOptions:\n  --search <text>      Text to search for\n  --field <field>      Field to search in: all, authority, city, title, summary\n  --exact              Use exact phrase matching\n  --output <value>     Output format or file path: json, csv, or a custom file path\n  --help               Show this help message\n\nExamples:\n  node index.js C:\\data\\may.zip --search "ayuntamiento de madrid" --field authority --exact\n  node index.js C:\\data\\may.zip --search "madrid" --field all --output csv\n  node index.js C:\\data\\may.zip --search "madrid" --output C:\\exports\\madrid.json\n`);
+  console.log(`placsp-filter
+
+Usage:
+  node index.js <zip-file-or-folder> --search "madrid" [--field all|authority|city|title|summary] [--exact] [--output json|csv|<file-path>]
+
+Options:
+  --search <text>      Text to search for
+  --field <field>      Field to search in: all, authority, city, title, summary
+  --exact              Use exact phrase matching
+  --output <value>     Output format or file path: json, csv, or a custom file path
+  --help               Show this help message
+
+Examples:
+  node index.js C:\data\may.zip --search "ayuntamiento de madrid" --field authority --exact
+  node index.js C:\data\zips --search "madrid" --field all --output csv
+`);
 }
 
 function parseArgs(argv) {
   const args = argv.slice(2);
   if (args.length === 0 || args.includes('--help') || args.includes('-h')) return { help: true };
 
-  let inputZip = null;
+  let inputPath = null;
   let search = null;
   let output = null;
   let field = 'all';
@@ -19,8 +34,8 @@ function parseArgs(argv) {
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (!arg.startsWith('--') && !inputZip) {
-      inputZip = arg;
+    if (!arg.startsWith('--') && !inputPath) {
+      inputPath = arg;
       continue;
     }
     if (arg === '--search') {
@@ -56,7 +71,7 @@ function parseArgs(argv) {
     }
   }
 
-  return { inputZip, search, output, field, exact, help: false };
+  return { inputPath, search, output, field, exact, help: false };
 }
 
 function decodeEntities(s) {
@@ -202,7 +217,7 @@ function generateRandomId() {
     .padStart(8, '0');
 }
 
-function parseEntry(entryXml, sourceFile, options) {
+function parseEntry(entryXml, sourceFile, zipFile, options) {
   const id = extractTag(entryXml, 'id');
   const shortId = id ? id.split('/').pop() : generateRandomId();
   const title = extractTag(entryXml, 'title');
@@ -233,7 +248,8 @@ function parseEntry(entryXml, sourceFile, options) {
     link,
     summary,
     documentUris,
-    sourceFile
+    sourceFile,
+    zipFile
   };
 
   if (!matchesSearch(options.search, entry, options.field, options.exact)) return null;
@@ -249,7 +265,7 @@ function escapeCsvValue(value) {
 function toCsv(results) {
   const headers = [
     'id',
-    "shortId",
+    'shortId',
     'contractFolderId',
     'title',
     'authorityName',
@@ -262,7 +278,8 @@ function toCsv(results) {
     'link',
     'summary',
     'documentUris',
-    'sourceFile'
+    'sourceFile',
+    'zipFile'
   ];
 
   const lines = [headers.join(',')];
@@ -272,8 +289,8 @@ function toCsv(results) {
   return lines.join('\n');
 }
 
-function resolveOutputConfig(outputValue, inputZip, search) {
-  const base = path.basename(inputZip, path.extname(inputZip));
+function resolveOutputConfig(outputValue, inputPath, search) {
+  const base = path.basename(inputPath, path.extname(inputPath));
   const slug = normalizeText(search || 'results').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'results';
   const scriptDir = __dirname;
   const outputDir = path.join(scriptDir, 'output');
@@ -303,7 +320,23 @@ function writeOutput(outputConfig, payload) {
   fs.writeFileSync(outputConfig.filePath, JSON.stringify(payload, null, 2), 'utf8');
 }
 
-function processZip(zipPath, outputConfig, options) {
+function getComparableTime(item) {
+  return new Date(item.updated || item.published || 0).getTime() || 0;
+}
+
+function deduplicateResults(results) {
+  const dedup = new Map();
+  for (const item of results) {
+    const key = item.id || item.shortId || item.contractFolderId || `${item.title}|${item.link}`;
+    const existing = dedup.get(key);
+    if (!existing || getComparableTime(item) >= getComparableTime(existing)) {
+      dedup.set(key, item);
+    }
+  }
+  return Array.from(dedup.values()).sort((a, b) => getComparableTime(b) - getComparableTime(a));
+}
+
+function processSingleZip(zipPath, options) {
   return new Promise((resolve, reject) => {
     yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
       if (err) return reject(err);
@@ -322,7 +355,7 @@ function processZip(zipPath, outputConfig, options) {
 
         zipfile.openReadStream(entry, (streamErr, readStream) => {
           if (streamErr) {
-            errors.push({ sourceFile: entry.fileName, error: streamErr.message });
+            errors.push({ zipFile: path.basename(zipPath), sourceFile: entry.fileName, error: streamErr.message });
             zipfile.readEntry();
             return;
           }
@@ -336,65 +369,98 @@ function processZip(zipPath, outputConfig, options) {
               const xml = isGzip ? zlib.gunzipSync(buf).toString('utf8') : buf.toString('utf8');
               const entries = extractAllEntries(xml);
               for (const entryXml of entries) {
-                const parsed = parseEntry(entryXml, entry.fileName, options);
+                const parsed = parseEntry(entryXml, entry.fileName, path.basename(zipPath), options);
                 if (parsed) results.push(parsed);
               }
             } catch (e) {
-              errors.push({ sourceFile: entry.fileName, error: e.message });
+              errors.push({ zipFile: path.basename(zipPath), sourceFile: entry.fileName, error: e.message });
             }
             zipfile.readEntry();
           });
           readStream.on('error', (e) => {
-            errors.push({ sourceFile: entry.fileName, error: e.message });
+            errors.push({ zipFile: path.basename(zipPath), sourceFile: entry.fileName, error: e.message });
             zipfile.readEntry();
           });
         });
       });
 
-      zipfile.on('end', () => {
-        const dedup = new Map();
-        for (const item of results) {
-          const key = item.id || `${item.contractFolderId}|${item.title}|${item.link}`;
-          if (!dedup.has(key)) dedup.set(key, item);
-        }
-
-        const finalResults = Array.from(dedup.values()).sort((a, b) => {
-          const da = new Date(a.updated || a.published || 0).getTime();
-          const db = new Date(b.updated || b.published || 0).getTime();
-          return db - da;
-        });
-
-        const payload = {
-          total: finalResults.length,
-          generatedAt: new Date().toISOString(),
-          inputZip: path.resolve(zipPath),
-          search: options.search,
-          field: options.field,
-          exact: options.exact,
-          results: finalResults,
-          errors
-        };
-
-        writeOutput(outputConfig, payload);
-        console.log(`OK: ${finalResults.length} results saved to ${outputConfig.filePath}`);
-        resolve(payload);
-      });
-
+      zipfile.on('end', () => resolve({ results, errors }));
       zipfile.on('error', reject);
     });
   });
 }
 
+function listZipFiles(inputPath) {
+  const stats = fs.statSync(inputPath);
+  if (stats.isFile()) return [inputPath];
+  return fs.readdirSync(inputPath)
+    .filter(name => name.toLowerCase().endsWith('.zip'))
+    .map(name => path.join(inputPath, name))
+    .sort((a, b) => a.localeCompare(b));
+}
+
+async function processInput(inputPath, outputConfig, options) {
+  const zipFiles = listZipFiles(inputPath);
+  if (zipFiles.length === 0) {
+    throw new Error(`No ZIP files found in: ${inputPath}`);
+  }
+
+  const allResults = [];
+  const allErrors = [];
+  const totalZips = zipFiles.length;
+
+  console.log(`Found ${totalZips} ZIP file(s) to process.`);
+
+  for (let index = 0; index < zipFiles.length; index++) {
+    const zipFile = zipFiles[index];
+    const percentBefore = Math.round((index / totalZips) * 100);
+
+    console.log(
+      `[${percentBefore}%] Processing ${index + 1}/${totalZips}: ${path.basename(zipFile)}`
+    );
+
+    const { results, errors } = await processSingleZip(zipFile, options);
+    allResults.push(...results);
+    allErrors.push(...errors);
+
+    const percentAfter = Math.round(((index + 1) / totalZips) * 100);
+
+    console.log(
+      `[${percentAfter}%] Finished ${index + 1}/${totalZips}: ${path.basename(zipFile)} | matches so far: ${allResults.length}`
+    );
+  }
+
+  console.log('[100%] Deduplicating combined results...');
+  const finalResults = deduplicateResults(allResults);
+
+  const payload = {
+    total: finalResults.length,
+    generatedAt: new Date().toISOString(),
+    inputPath: path.resolve(inputPath),
+    zipFiles: zipFiles.map(file => path.resolve(file)),
+    search: options.search,
+    field: options.field,
+    exact: options.exact,
+    results: finalResults,
+    errors: allErrors
+  };
+
+  writeOutput(outputConfig, payload);
+  console.log(`OK: ${finalResults.length} results saved to ${outputConfig.filePath}`);
+  console.log(`Processed ZIP files: ${zipFiles.length}`);
+  return payload;
+}
+
 async function main() {
-  const { inputZip, search, output, field, exact, help } = parseArgs(process.argv);
+  const { inputPath, search, output, field, exact, help } = parseArgs(process.argv);
 
   if (help) {
     printHelp();
     return;
   }
 
-  if (!inputZip || !search) {
-    console.error('Missing required arguments. You must provide <zip-file> and --search <text>.');
+  if (!inputPath || !search) {
+    console.error('Missing required arguments. You must provide <zip-file-or-folder> and --search <text>.');
     printHelp();
     process.exit(1);
   }
@@ -405,18 +471,18 @@ async function main() {
     process.exit(1);
   }
 
-  const zipPath = path.resolve(inputZip);
-  if (!fs.existsSync(zipPath)) {
-    console.error(`ZIP file not found: ${zipPath}`);
+  const resolvedInputPath = path.resolve(inputPath);
+  if (!fs.existsSync(resolvedInputPath)) {
+    console.error(`Input path not found: ${resolvedInputPath}`);
     process.exit(1);
   }
 
-  const outputConfig = resolveOutputConfig(output, zipPath, search);
+  const outputConfig = resolveOutputConfig(output, resolvedInputPath, search);
 
   try {
-    await processZip(zipPath, outputConfig, { search, field, exact });
+    await processInput(resolvedInputPath, outputConfig, { search, field, exact });
   } catch (e) {
-    console.error(`Error processing ZIP file: ${e.message}`);
+    console.error(`Error processing input path: ${e.message}`);
     process.exit(1);
   }
 }
