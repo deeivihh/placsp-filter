@@ -7,18 +7,23 @@ function printHelp() {
   console.log(`placsp-filter
 
 Usage:
-  node index.js <zip-file-or-folder> --search "madrid" [--field all|authority|city|title|summary] [--exact] [--output json|csv|<file-path>]
+  node index.js <zip-file-or-folder> [--search "madrid"] [--city "medina del campo"] [--authority "ayuntamiento de medina del campo"] [--title "endoscopia"] [--summary "hospital"] [--field all|authority|city|title|summary] [--exact] [--output json|csv|<file-path>]
 
 Options:
-  --search <text>      Text to search for
-  --field <field>      Field to search in: all, authority, city, title, summary
-  --exact              Use exact phrase matching
+  --search <text>      Text to search for in the selected field or in all fields
+  --city <text>        Filter by city
+  --authority <text>   Filter by contracting authority name
+  --title <text>       Filter by title
+  --summary <text>     Filter by summary
+  --field <field>      Field to search in for --search: all, authority, city, title, summary
+  --exact              Use exact phrase matching for filters
   --output <value>     Output format or file path: json, csv, or a custom file path
   --help               Show this help message
 
 Examples:
   node index.js C:\data\may.zip --search "ayuntamiento de madrid" --field authority --exact
-  node index.js C:\data\zips --search "madrid" --field all --output csv
+  node index.js C:\data\zips --city "madrid" --output csv
+  node index.js C:\data\zips --city "madrid" --authority "ayuntamiento de madrid" --output C:\exports\madrid.json
 `);
 }
 
@@ -28,6 +33,10 @@ function parseArgs(argv) {
 
   let inputPath = null;
   let search = null;
+  let city = null;
+  let authority = null;
+  let title = null;
+  let summary = null;
   let output = null;
   let field = 'all';
   let exact = false;
@@ -45,6 +54,42 @@ function parseArgs(argv) {
     }
     if (arg.startsWith('--search=')) {
       search = arg.slice('--search='.length);
+      continue;
+    }
+    if (arg === '--city') {
+      city = args[i + 1];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--city=')) {
+      city = arg.slice('--city='.length);
+      continue;
+    }
+    if (arg === '--authority') {
+      authority = args[i + 1];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--authority=')) {
+      authority = arg.slice('--authority='.length);
+      continue;
+    }
+    if (arg === '--title') {
+      title = args[i + 1];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--title=')) {
+      title = arg.slice('--title='.length);
+      continue;
+    }
+    if (arg === '--summary') {
+      summary = args[i + 1];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--summary=')) {
+      summary = arg.slice('--summary='.length);
       continue;
     }
     if (arg === '--output') {
@@ -71,7 +116,7 @@ function parseArgs(argv) {
     }
   }
 
-  return { inputPath, search, output, field, exact, help: false };
+  return { inputPath, search, city, authority, title, summary, output, field, exact, help: false };
 }
 
 function decodeEntities(s) {
@@ -194,6 +239,21 @@ function getSearchableFields(entry) {
   };
 }
 
+function matchesTextFilter(value, expected, exact) {
+  const hay = normalizeText(value);
+  const q = normalizeText(expected);
+
+  if (!q) return true;
+  if (!hay) return false;
+
+  if (exact) {
+    return hay === q || hay.includes(q);
+  }
+
+  const tokens = q.split(/\s+/).filter(Boolean);
+  return tokens.every(token => hay.includes(token));
+}
+
 function matchesSearch(search, entry, field, exact) {
   const q = normalizeText(search);
   if (!q) return true;
@@ -209,6 +269,29 @@ function matchesSearch(search, entry, field, exact) {
 
   const tokens = q.split(/\s+/).filter(Boolean);
   return tokens.every(token => hay.includes(token));
+}
+
+function matchesFilters(entry, options) {
+  if (options.search && !matchesSearch(options.search, entry, options.field, options.exact)) {
+    return false;
+  }
+  if (options.city && !matchesTextFilter(entry.city, options.city, options.exact)) {
+    return false;
+  }
+  if (options.authority && !matchesTextFilter(entry.authorityName, options.authority, options.exact)) {
+    return false;
+  }
+  if (options.title && !matchesTextFilter(entry.title, options.title, options.exact)) {
+    return false;
+  }
+  if (options.summary && !matchesTextFilter(entry.summary, options.summary, options.exact)) {
+    return false;
+  }
+  return true;
+}
+
+function hasAtLeastOneFilter(options) {
+  return Boolean(options.search || options.city || options.authority || options.title || options.summary);
 }
 
 function generateRandomId() {
@@ -252,7 +335,7 @@ function parseEntry(entryXml, sourceFile, zipFile, options) {
     zipFile
   };
 
-  if (!matchesSearch(options.search, entry, options.field, options.exact)) return null;
+  if (!matchesFilters(entry, options)) return null;
   return entry;
 }
 
@@ -289,9 +372,10 @@ function toCsv(results) {
   return lines.join('\n');
 }
 
-function resolveOutputConfig(outputValue, inputPath, search) {
+function resolveOutputConfig(outputValue, inputPath, options) {
   const base = path.basename(inputPath, path.extname(inputPath));
-  const slug = normalizeText(search || 'results').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'results';
+  const slugSource = options.search || options.city || options.authority || options.title || options.summary || 'results';
+  const slug = normalizeText(slugSource).replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'results';
   const scriptDir = __dirname;
   const outputDir = path.join(scriptDir, 'output');
   fs.mkdirSync(outputDir, { recursive: true });
@@ -415,9 +499,7 @@ async function processInput(inputPath, outputConfig, options) {
     const zipFile = zipFiles[index];
     const percentBefore = Math.round((index / totalZips) * 100);
 
-    console.log(
-      `[${percentBefore}%] Processing ${index + 1}/${totalZips}: ${path.basename(zipFile)}`
-    );
+    console.log(`[${percentBefore}%] Processing ${index + 1}/${totalZips}: ${path.basename(zipFile)}`);
 
     const { results, errors } = await processSingleZip(zipFile, options);
     allResults.push(...results);
@@ -425,9 +507,7 @@ async function processInput(inputPath, outputConfig, options) {
 
     const percentAfter = Math.round(((index + 1) / totalZips) * 100);
 
-    console.log(
-      `[${percentAfter}%] Finished ${index + 1}/${totalZips}: ${path.basename(zipFile)} | matches so far: ${allResults.length}`
-    );
+    console.log(`[${percentAfter}%] Finished ${index + 1}/${totalZips}: ${path.basename(zipFile)} | matches so far: ${allResults.length}`);
   }
 
   console.log('[100%] Deduplicating combined results...');
@@ -439,6 +519,10 @@ async function processInput(inputPath, outputConfig, options) {
     inputPath: path.resolve(inputPath),
     zipFiles: zipFiles.map(file => path.resolve(file)),
     search: options.search,
+    city: options.city,
+    authority: options.authority,
+    title: options.title,
+    summary: options.summary,
     field: options.field,
     exact: options.exact,
     results: finalResults,
@@ -452,15 +536,23 @@ async function processInput(inputPath, outputConfig, options) {
 }
 
 async function main() {
-  const { inputPath, search, output, field, exact, help } = parseArgs(process.argv);
+  const { inputPath, search, city, authority, title, summary, output, field, exact, help } = parseArgs(process.argv);
 
   if (help) {
     printHelp();
     return;
   }
 
-  if (!inputPath || !search) {
-    console.error('Missing required arguments. You must provide <zip-file-or-folder> and --search <text>.');
+  if (!inputPath) {
+    console.error('Missing required arguments. You must provide <zip-file-or-folder>.');
+    printHelp();
+    process.exit(1);
+  }
+
+  const options = { search, city, authority, title, summary, field, exact };
+
+  if (!hasAtLeastOneFilter(options)) {
+    console.error('You must provide at least one filter: --search, --city, --authority, --title, or --summary.');
     printHelp();
     process.exit(1);
   }
@@ -477,10 +569,10 @@ async function main() {
     process.exit(1);
   }
 
-  const outputConfig = resolveOutputConfig(output, resolvedInputPath, search);
+  const outputConfig = resolveOutputConfig(output, resolvedInputPath, options);
 
   try {
-    await processInput(resolvedInputPath, outputConfig, { search, field, exact });
+    await processInput(resolvedInputPath, outputConfig, options);
   } catch (e) {
     console.error(`Error processing input path: ${e.message}`);
     process.exit(1);
