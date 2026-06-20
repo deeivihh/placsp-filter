@@ -241,7 +241,7 @@ function parseEntry(entryXml, sourceFile, options) {
 }
 
 function escapeCsvValue(value) {
-  const stringValue = Array.isArray(value) ? value.join(' | ') : String(value ?? '');
+  const stringValue = Array.isArray(value) ? JSON.stringify(value) : String(value ?? '');
   const escaped = stringValue.replace(/"/g, '""');
   return `"${escaped}"`;
 }
