@@ -1,0 +1,11 @@
+{
+  "name": "placsp-filter",
+  "private": true,
+  "version": "1.0.0",
+  "bin": {
+    "placsp-filter": "./placsp-filter.js"
+  },
+  "dependencies": {
+    "yauzl": "^3.1.3"
+  }
+}
